@@ -33,7 +33,9 @@ class SpeedTowardBallReward(RewardFunction[AgentID, GameState, float]):
     def reset(self, *_) -> None:
         pass
 
-    def get_rewards(self, agents: List[AgentID], state: GameState,
+    def get_rewards(self,
+                    agents: List[AgentID],
+                    state: GameState,
                     is_terminated: Dict[AgentID, bool],
                     is_truncated: Dict[AgentID, bool],
                     shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
@@ -55,7 +57,9 @@ class InAirReward(RewardFunction[AgentID, GameState, float]):
     def reset(self, *_) -> None:
         pass
 
-    def get_rewards(self, agents: List[AgentID], state: GameState,
+    def get_rewards(self,
+                    agents: List[AgentID],
+                    state: GameState,
                     is_terminated: Dict[AgentID, bool],
                     is_truncated: Dict[AgentID, bool],
                     shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
@@ -66,14 +70,16 @@ class VelocityBallToGoalReward(RewardFunction[AgentID, GameState, float]):
     def reset(self, *_) -> None:
         pass
 
-    def get_rewards(self, agents: List[AgentID], state: GameState,
+    def get_rewards(self,
+                    agents: List[AgentID],
+                    state: GameState,
                     is_terminated: Dict[AgentID, bool],
                     is_truncated: Dict[AgentID, bool],
                     shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
         out: Dict[AgentID, float] = {}
         for a in agents:
             # For orange: goal_dir = +1 (ball moving toward orange goal at negative Y),
-            # for blue: goal_dir = -1
+            # for blue:    goal_dir = -1
             goal_dir = 1 if state.cars[a].is_orange else -1
             vely = float(state.ball.linear_velocity[1])
             out[a] = max(goal_dir * vely / common_values.BALL_MAX_SPEED, 0.0)
@@ -85,8 +91,8 @@ class VelocityBallToGoalReward(RewardFunction[AgentID, GameState, float]):
 def build_env(spawn_opponents: bool = True, tick_skip: int = 8):
     """
     Build a single RLGym environment with:
-      - 1v1 vs bots if spawn_opponents=True, else 1v0 (self‐play).
-      - 8× tick_skip frames between actions.
+      - 1v1 vs bots if spawn_opponents=True, else 1v0 (self-play).
+      - tick_skip frames between actions.
       - RLViser lookup table if available.
     """
     # Action parser: RLViser220 lookup if installed, else default lookup
@@ -153,45 +159,73 @@ if __name__ == "__main__":
     # 2) Choose how many parallel environments (n_proc)
     if device == "cuda":
         num_gpus = torch.cuda.device_count()
-        # e.g. 24 envs per GPU → 8 GPUs ⇒ 192 envs
-        n_proc = 24 * num_gpus
+        # e.g. 16–24 envs per GPU → 8 GPUs ⇒ ~128–192 envs
+        # You can start with 16 per GPU and then scale up if CPU can handle more.
+        n_proc = 16 * num_gpus
         # Don’t exceed total CPU cores
         n_proc = min(n_proc, os.cpu_count())
     else:
         # Leave one core for OS, use the rest
         n_proc = max(1, os.cpu_count() - 1)
 
-    # 3) Construct the PPO learner. We use larger batch sizes on GPU, smaller on CPU
-    learner = Learner(
-        build_env,
-        n_proc=n_proc,
-        min_inference_size=int(n_proc * 0.9),
-        device=device,
-        # On GPU, we use big batches so each H100 sees ~100k states per update
-        ppo_batch_size=(400_000 if device == "cuda" else 100_000),
-        ppo_minibatch_size=(100_000 if device == "cuda" else 25_000),
-        policy_layer_sizes=([4096, 4096, 2048, 2048] if device == "cuda" else [1024, 1024, 512, 512]),
-        critic_layer_sizes=([4096, 4096, 2048, 2048] if device == "cuda" else [1024, 1024, 512, 512]),
-        ts_per_iteration=(1_000_000 if device == "cuda" else 200_000),
-        exp_buffer_size=(400_000 * 3 if device == "cuda" else 100_000 * 3),
-        ppo_epochs=2,
-        ppo_ent_coef=0.01,
-        policy_lr=5e-5,
-        critic_lr=5e-5,
-        standardize_returns=True,
-        standardize_obs=False,
-        save_every_ts=(1_000_000 if device == "cuda" else 200_000),
-        timestep_limit=2_000_000_000,
-        log_to_wandb=False
-    )
+    # 3) Compute minimum inference size (we wait until ~97% of envs are ready)
+    min_inf = int(n_proc * 0.97)
 
-    # 4) If we have multiple GPUs, wrap only the internal network(s) in DataParallel
+    # 4) Construct the PPO learner with larger batch sizes on GPU, smaller on CPU
+    if device == "cuda":
+        # On GPU: push much larger batch sizes to keep 8× H100 busy
+        learner = Learner(
+            build_env,
+            n_proc=n_proc,
+            min_inference_size=min_inf,
+            device=device,
+            ppo_batch_size=400_000,       # total minibatch per PPO epoch
+            ppo_minibatch_size=100_000,   # size per DataParallel chunk (≈12.5k/GPU)
+            policy_layer_sizes=[4096, 4096, 2048, 2048],
+            critic_layer_sizes=[4096, 4096, 2048, 2048],
+            ts_per_iteration=4_000_000,   # collect 4M timesteps before each big update
+            exp_buffer_size=4_000_000,    # hold 4M total samples in buffer
+            ppo_epochs=2,
+            ppo_ent_coef=0.01,
+            policy_lr=5e-5,
+            critic_lr=5e-5,
+            standardize_returns=True,
+            standardize_obs=False,
+            save_every_ts=2_000_000,       # checkpoint every 2M timesteps
+            timestep_limit=2_000_000_000,
+            log_to_wandb=False
+        )
+    else:
+        # On CPU: smaller batch sizes so you don't OOM or stall the CPU
+        learner = Learner(
+            build_env,
+            n_proc=n_proc,
+            min_inference_size=min_inf,
+            device=device,
+            ppo_batch_size=100_000,
+            ppo_minibatch_size=25_000,
+            policy_layer_sizes=[1024, 1024, 512, 512],
+            critic_layer_sizes=[1024, 1024, 512, 512],
+            ts_per_iteration=200_000,
+            exp_buffer_size=300_000,
+            ppo_epochs=2,
+            ppo_ent_coef=0.01,
+            policy_lr=1e-4,
+            critic_lr=1e-4,
+            standardize_returns=True,
+            standardize_obs=False,
+            save_every_ts=200_000,
+            timestep_limit=2_000_000_000,
+            log_to_wandb=False
+        )
+
+    # 5) If we have multiple GPUs, wrap only the internal network(s) in DataParallel
     if device == "cuda" and torch.cuda.device_count() > 1:
         from torch.nn import DataParallel
 
         ppo_obj = learner.ppo_learner
 
-        # — Wrap policy’s internal net/model, not the outer policy object —
+        # — Wrap policy’s internal network/model, not the outer policy object —
         if hasattr(ppo_obj, "policy"):
             pol = ppo_obj.policy
             if hasattr(pol, "net"):
@@ -205,7 +239,6 @@ if __name__ == "__main__":
             raise RuntimeError("ppo_learner has no attribute 'policy'")
 
         # — Wrap critic’s network portion —
-        # Common names in RLgym-PPO are “.critic” (outer), inside which might be .net or .model
         if hasattr(ppo_obj, "critic"):
             cri = ppo_obj.critic
             if hasattr(cri, "net"):
@@ -228,5 +261,5 @@ if __name__ == "__main__":
 
         print(f"Wrapped policy and critic internals in DataParallel on {torch.cuda.device_count()} GPUs.")
 
-    # 5) Finally, start training. This one process will use all GPUs for each update.
+    # 6) Finally, start training. This one process will use all GPUs for each update.
     learner.learn()
