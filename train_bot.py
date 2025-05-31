@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import torch
 import numpy as np
@@ -29,7 +30,7 @@ class SpeedTowardBallReward(RewardFunction[AgentID, GameState, float]):
     def reset(self, *_) -> None:
         pass
 
-    def get_rewards(self, agents, state, *_):
+    def get_rewards(self, agents, state, *_) -> Dict[AgentID, float]:
         out: Dict[AgentID, float] = {}
         for a in agents:
             car = state.cars[a]
@@ -46,7 +47,7 @@ class InAirReward(RewardFunction[AgentID, GameState, float]):
     def reset(self, *_) -> None:
         pass
 
-    def get_rewards(self, agents, state, *_):
+    def get_rewards(self, agents, state, *_) -> Dict[AgentID, float]:
         return {a: float(not state.cars[a].on_ground) for a in agents}
 
 
@@ -54,9 +55,10 @@ class VelocityBallToGoalReward(RewardFunction[AgentID, GameState, float]):
     def reset(self, *_) -> None:
         pass
 
-    def get_rewards(self, agents, state, *_):
+    def get_rewards(self, agents, state, *_) -> Dict[AgentID, float]:
         out: Dict[AgentID, float] = {}
         for a in agents:
+            # If Orange, goal is at negative Y; if Blue, goal is at +Y
             goal_dir = 1 if state.cars[a].is_orange else -1
             vely = state.ball.linear_velocity[1]
             out[a] = max(goal_dir * vely / common_values.BALL_MAX_SPEED, 0.0)
@@ -93,7 +95,7 @@ def build_env(spawn_opponents: bool = True, tick_skip: int = 8):
         KickoffMutator()
     )
 
-    env = RLGym(
+    rlgym_env = RLGym(
         state_mutator=state_mutator,
         obs_builder=obs_builder,
         action_parser=ap,
@@ -105,54 +107,73 @@ def build_env(spawn_opponents: bool = True, tick_skip: int = 8):
         ),
         transition_engine=RocketSimEngine()
     )
-    return RLGymV2GymWrapper(env)
+
+    return RLGymV2GymWrapper(rlgym_env)
 
 
 if __name__ == "__main__":
-    # 1) Detect CUDA / CPU
+    # 1) Device selection: prefer "cuda" if available
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 2) Determine number of GPUs and appropriate n_proc
+    # 2) Set n_proc based on CPU vs GPU environment
     if device == "cuda":
         num_gpus = torch.cuda.device_count()
-        # Use 24 environments per GPU (so 24 * 8 = 192) on an 8×H100 Blade
-        # If you want to push to one per vCPU (208 vCPUs), set n_proc = 208
+        # We'll assign 24 envs per GPU (for 8 GPUs → 192 envs)
         n_proc = 24 * num_gpus
+        # But do not ever exceed the number of vCPUs available
         if n_proc > os.cpu_count():
-            n_proc = os.cpu_count()  # do not exceed available vCPUs
+            n_proc = os.cpu_count()
     else:
-        # On a CPU‐only machine, use one process per physical core
+        # On CPU-only, use (cpu_count - 1) to leave one core for OS
         n_proc = max(1, os.cpu_count() - 1)
 
-    # 3) Create the Learner
+    # 3) Create the RLgym-PPO Learner
     learner = Learner(
         build_env,
         n_proc=n_proc,
         min_inference_size=int(n_proc * 0.9),
         device=device,
-        ppo_batch_size=400_000 if device == "cuda" else 100_000,
-        ppo_minibatch_size=100_000 if device == "cuda" else 25_000,
-        policy_layer_sizes=[4096, 4096, 2048, 2048] if device == "cuda" else [1024, 1024, 512, 512],
-        critic_layer_sizes=[4096, 4096, 2048, 2048] if device == "cuda" else [1024, 1024, 512, 512],
-        ts_per_iteration=1_000_000 if device == "cuda" else 200_000,
-        exp_buffer_size=(400_000 * 3) if device == "cuda" else (100_000 * 3),
+        ppo_batch_size=(400_000 if device == "cuda" else 100_000),
+        ppo_minibatch_size=(100_000 if device == "cuda" else 25_000),
+        policy_layer_sizes=([4096, 4096, 2048, 2048] if device == "cuda" else [1024, 1024, 512, 512]),
+        critic_layer_sizes=([4096, 4096, 2048, 2048] if device == "cuda" else [1024, 1024, 512, 512]),
+        ts_per_iteration=(1_000_000 if device == "cuda" else 200_000),
+        exp_buffer_size=(400_000 * 3 if device == "cuda" else 100_000 * 3),
         ppo_epochs=2,
         ppo_ent_coef=0.01,
         policy_lr=5e-5,
         critic_lr=5e-5,
         standardize_returns=True,
         standardize_obs=False,
-        save_every_ts=1_000_000 if device == "cuda" else 200_000,
+        save_every_ts=(1_000_000 if device == "cuda" else 200_000),
         timestep_limit=2_000_000_000,
         log_to_wandb=False
     )
 
-    # 4) If CUDA is available and more than one GPU, wrap policy & critic in DataParallel
+    # 4) Wrap policy & critic in DataParallel, but *only if* those attributes exist
     if device == "cuda" and torch.cuda.device_count() > 1:
         from torch.nn import DataParallel
 
-        learner.ppo_learner.policy = DataParallel(learner.ppo_learner.policy)
-        learner.ppo_learner.critic = DataParallel(learner.ppo_learner.critic)
+        # The PPOLearner instance lives at learner.ppo_learner
+        ppo_obj = learner.ppo_learner
 
-    # 5) Start training
+        # Wrap the policy network if it exists
+        if hasattr(ppo_obj, "policy"):
+            ppo_obj.policy = DataParallel(ppo_obj.policy)
+        else:
+            # In case RLgym-PPO renamed it—try common alternatives:
+            if hasattr(ppo_obj, "actor"):
+                ppo_obj.actor = DataParallel(ppo_obj.actor)
+
+        # Wrap the critic (value network) if it exists
+        if hasattr(ppo_obj, "critic"):
+            ppo_obj.critic = DataParallel(ppo_obj.critic)
+        else:
+            # Maybe it’s called "critic_net" or "value_net"
+            if hasattr(ppo_obj, "critic_net"):
+                ppo_obj.critic_net = DataParallel(ppo_obj.critic_net)
+            elif hasattr(ppo_obj, "value_net"):
+                ppo_obj.value_net = DataParallel(ppo_obj.value_net)
+
+    # 5) Start training (this one process will drive all GPUs if DataParallel succeeded)
     learner.learn()
