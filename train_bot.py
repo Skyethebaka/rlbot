@@ -17,6 +17,7 @@ from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMut
 from rlgym_ppo.util import RLGymV2GymWrapper
 from rlgym_ppo import Learner
 
+# Try to import the 220-entry RLViser lookup table. Fall back if unavailable.
 try:
     from rlviser_py.tables import RLViser220
 except ModuleNotFoundError:
@@ -26,19 +27,26 @@ except ModuleNotFoundError:
         RLViser220 = None
 
 
+# ---------------- Reward Definitions ----------------
+
 class SpeedTowardBallReward(RewardFunction[AgentID, GameState, float]):
     def reset(self, *_) -> None:
         pass
 
-    def get_rewards(self, agents, state, *_) -> Dict[AgentID, float]:
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                    is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool],
+                    shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
         out: Dict[AgentID, float] = {}
         for a in agents:
             car = state.cars[a]
+            # If the car is on orange team, physics are “flipped”
             cphy = car.physics if car.is_orange else car.inverted_physics
             bphy = state.ball if car.is_orange else state.inverted_ball
             diff = bphy.position - cphy.position
             vel = cphy.linear_velocity
-            spd = np.dot(vel, diff / (np.linalg.norm(diff) + 1e-6))
+            # dot(velocity, direction_to_ball)
+            spd = float(np.dot(vel, diff / (np.linalg.norm(diff) + 1e-6)))
             out[a] = max(spd / common_values.CAR_MAX_SPEED, 0.0)
         return out
 
@@ -47,7 +55,10 @@ class InAirReward(RewardFunction[AgentID, GameState, float]):
     def reset(self, *_) -> None:
         pass
 
-    def get_rewards(self, agents, state, *_) -> Dict[AgentID, float]:
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                    is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool],
+                    shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
         return {a: float(not state.cars[a].on_ground) for a in agents}
 
 
@@ -55,28 +66,52 @@ class VelocityBallToGoalReward(RewardFunction[AgentID, GameState, float]):
     def reset(self, *_) -> None:
         pass
 
-    def get_rewards(self, agents, state, *_) -> Dict[AgentID, float]:
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                    is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool],
+                    shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
         out: Dict[AgentID, float] = {}
         for a in agents:
-            # If Orange, goal is at negative Y; if Blue, goal is at +Y
+            # For orange: goal_dir = +1 (ball moving toward orange goal at negative Y),
+            # for blue: goal_dir = -1
             goal_dir = 1 if state.cars[a].is_orange else -1
-            vely = state.ball.linear_velocity[1]
+            vely = float(state.ball.linear_velocity[1])
             out[a] = max(goal_dir * vely / common_values.BALL_MAX_SPEED, 0.0)
         return out
 
 
+# ---------------- Environment Builder ----------------
+
 def build_env(spawn_opponents: bool = True, tick_skip: int = 8):
-    lp = LookupTableAction(custom_table=RLViser220) if RLViser220 else LookupTableAction()
+    """
+    Build a single RLGym environment with:
+      - 1v1 vs bots if spawn_opponents=True, else 1v0 (self‐play).
+      - 8× tick_skip frames between actions.
+      - RLViser lookup table if available.
+    """
+    # Action parser: RLViser220 lookup if installed, else default lookup
+    if RLViser220 is not None:
+        lp = LookupTableAction(custom_table=RLViser220)
+    else:
+        lp = LookupTableAction()
     ap = RepeatAction(lp, repeats=tick_skip)
 
-    reward_fn = CombinedReward(
-        (TouchReward(), 0.05),
-        (InAirReward(), 0.002),
-        (SpeedTowardBallReward(), 0.01),
-        (VelocityBallToGoalReward(), 0.1),
-        (GoalReward(), 10.0)
+    # Termination/truncation conditions
+    trunc_cond = AnyCondition(
+        NoTouchTimeoutCondition(timeout_seconds=30),
+        TimeoutCondition(timeout_seconds=300)
     )
 
+    # Reward function: combine several shaped rewards
+    reward_fn = CombinedReward(
+        (TouchReward(),               0.05),
+        (InAirReward(),               0.002),
+        (SpeedTowardBallReward(),     0.01),
+        (VelocityBallToGoalReward(),  0.1),
+        (GoalReward(),                10.0)
+    )
+
+    # Observation builder: normalized positions, angles, velocities, boost
     obs_builder = DefaultObs(
         zero_padding=None,
         pos_coef=np.asarray([
@@ -90,8 +125,9 @@ def build_env(spawn_opponents: bool = True, tick_skip: int = 8):
         boost_coef=0.01
     )
 
+    # Fix team size (1v1 or 1v0) and apply random kickoff
     state_mutator = MutatorSequence(
-        FixedTeamSizeMutator(blue_size=1, orange_size=1),
+        FixedTeamSizeMutator(blue_size=1, orange_size=(1 if spawn_opponents else 0)),
         KickoffMutator()
     )
 
@@ -101,38 +137,37 @@ def build_env(spawn_opponents: bool = True, tick_skip: int = 8):
         action_parser=ap,
         reward_fn=reward_fn,
         termination_cond=GoalCondition(),
-        truncation_cond=AnyCondition(
-            NoTouchTimeoutCondition(30),
-            TimeoutCondition(300)
-        ),
+        truncation_cond=trunc_cond,
         transition_engine=RocketSimEngine()
     )
 
     return RLGymV2GymWrapper(rlgym_env)
 
 
+# ---------------- Main Training Script ----------------
+
 if __name__ == "__main__":
-    # 1) Device selection: prefer "cuda" if available
+    # 1) Determine device (prefer GPU if available)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 2) Set n_proc based on CPU vs GPU environment
+    # 2) Choose how many parallel environments (n_proc)
     if device == "cuda":
         num_gpus = torch.cuda.device_count()
-        # We'll assign 24 envs per GPU (for 8 GPUs → 192 envs)
+        # e.g. 24 envs per GPU → 8 GPUs ⇒ 192 envs
         n_proc = 24 * num_gpus
-        # But do not ever exceed the number of vCPUs available
-        if n_proc > os.cpu_count():
-            n_proc = os.cpu_count()
+        # Don’t exceed total CPU cores
+        n_proc = min(n_proc, os.cpu_count())
     else:
-        # On CPU-only, use (cpu_count - 1) to leave one core for OS
+        # Leave one core for OS, use the rest
         n_proc = max(1, os.cpu_count() - 1)
 
-    # 3) Create the RLgym-PPO Learner
+    # 3) Construct the PPO learner. We use larger batch sizes on GPU, smaller on CPU
     learner = Learner(
         build_env,
         n_proc=n_proc,
         min_inference_size=int(n_proc * 0.9),
         device=device,
+        # On GPU, we use big batches so each H100 sees ~100k states per update
         ppo_batch_size=(400_000 if device == "cuda" else 100_000),
         ppo_minibatch_size=(100_000 if device == "cuda" else 25_000),
         policy_layer_sizes=([4096, 4096, 2048, 2048] if device == "cuda" else [1024, 1024, 512, 512]),
@@ -150,30 +185,48 @@ if __name__ == "__main__":
         log_to_wandb=False
     )
 
-    # 4) Wrap policy & critic in DataParallel, but *only if* those attributes exist
+    # 4) If we have multiple GPUs, wrap only the internal network(s) in DataParallel
     if device == "cuda" and torch.cuda.device_count() > 1:
         from torch.nn import DataParallel
 
-        # The PPOLearner instance lives at learner.ppo_learner
         ppo_obj = learner.ppo_learner
 
-        # Wrap the policy network if it exists
+        # — Wrap policy’s internal net/model, not the outer policy object —
         if hasattr(ppo_obj, "policy"):
-            ppo_obj.policy = DataParallel(ppo_obj.policy)
+            pol = ppo_obj.policy
+            if hasattr(pol, "net"):
+                pol.net = DataParallel(pol.net)
+            elif hasattr(pol, "model"):
+                pol.model = DataParallel(pol.model)
+            else:
+                # If RLgym-PPO uses a different attribute name, you could add more checks here
+                raise RuntimeError("Policy network not found under .net or .model; cannot parallelize.")
         else:
-            # In case RLgym-PPO renamed it—try common alternatives:
-            if hasattr(ppo_obj, "actor"):
-                ppo_obj.actor = DataParallel(ppo_obj.actor)
+            raise RuntimeError("ppo_learner has no attribute 'policy'")
 
-        # Wrap the critic (value network) if it exists
+        # — Wrap critic’s network portion —
+        # Common names in RLgym-PPO are “.critic” (outer), inside which might be .net or .model
         if hasattr(ppo_obj, "critic"):
-            ppo_obj.critic = DataParallel(ppo_obj.critic)
+            cri = ppo_obj.critic
+            if hasattr(cri, "net"):
+                cri.net = DataParallel(cri.net)
+            elif hasattr(cri, "model"):
+                cri.model = DataParallel(cri.model)
+            else:
+                # Some versions call it “.critic_net” or so—check those too
+                if hasattr(ppo_obj, "critic_net"):
+                    ppo_obj.critic_net = DataParallel(ppo_obj.critic_net)
+                else:
+                    raise RuntimeError("Critic network not found under .net, .model, or .critic_net; cannot parallelize.")
         else:
-            # Maybe it’s called "critic_net" or "value_net"
-            if hasattr(ppo_obj, "critic_net"):
-                ppo_obj.critic_net = DataParallel(ppo_obj.critic_net)
-            elif hasattr(ppo_obj, "value_net"):
+            # It’s possible your RLgym-PPO version names the critic differently,
+            # e.g. “.value_net.” If so, check and wrap that instead:
+            if hasattr(ppo_obj, "value_net"):
                 ppo_obj.value_net = DataParallel(ppo_obj.value_net)
+            else:
+                raise RuntimeError("ppo_learner has no attribute 'critic' or 'value_net'.")
 
-    # 5) Start training (this one process will drive all GPUs if DataParallel succeeded)
+        print(f"Wrapped policy and critic internals in DataParallel on {torch.cuda.device_count()} GPUs.")
+
+    # 5) Finally, start training. This one process will use all GPUs for each update.
     learner.learn()
