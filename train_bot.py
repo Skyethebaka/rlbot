@@ -91,7 +91,7 @@ def build_env(spawn_opponents: bool = True, tick_skip: int = 8):
 
 if __name__ == "__main__":
     device = "cuda"
-    n_proc = 192
+    n_proc = 96
     learner = Learner(
         build_env,
         n_proc=n_proc,
