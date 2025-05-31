@@ -97,11 +97,11 @@ if __name__ == "__main__":
         n_proc=n_proc,
         min_inference_size=int(n_proc * 0.9),
         device=device,
-        ppo_batch_size=800_000,
-        ppo_minibatch_size=200_000,
+        ppo_batch_size=400_000,
+        ppo_minibatch_size=100_000,
         policy_layer_sizes=[4096, 4096, 2048, 2048],
         critic_layer_sizes=[4096, 4096, 2048, 2048],
-        ts_per_iteration=2_000_000,
+        ts_per_iteration=1_000_000,
         exp_buffer_size=2_000_000,
         ppo_epochs=2,
         ppo_ent_coef=0.01,
@@ -109,7 +109,7 @@ if __name__ == "__main__":
         critic_lr=5e-5,
         standardize_returns=True,
         standardize_obs=False,
-        save_every_ts=2_000_000,
+        save_every_ts=1_000_000,
         timestep_limit=2_000_000_000,
         log_to_wandb=False
     )
